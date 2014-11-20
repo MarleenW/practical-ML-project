@@ -1,0 +1,239 @@
+---
+title: "Weight Lifting"
+author: "Marleen Westerik"
+date: "Thursday, November 20, 2014"
+output: html_document
+---
+```{r globaleOpties, include=FALSE}
+library(knitr)
+opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+As part of the Practical Machine Learning Course offered by the John Hopkins University via Coursera, this document outlines the process and results of a real-world machine learning task. The task involves data from people doing several work-out excercises in different positions. The positions, coded with the letters A-E, are to be predicted based on data gained from several workout-devices. The data is provided by Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. The details of their study can be found at: http://groupware.les.inf.puc-rio.br/har#ixzz3JbDhSlkw.
+
+# Data
+To following code loads the data from the folder where it is located on the authors PC, and loads the `caret` package, which will be used extensively in the remainder of this project.
+
+```{r loadDataAndLib}
+setwd("~/coursera/practical ML/project")
+
+library(caret)
+
+training <- read.csv('pml-training.csv') # has classe column
+testing <- read.csv('pml-testing.csv') # has problem_id column
+```
+
+The training data, as provided, contains `r nrow(training)` observations of `r ncol(training)` variables. This makes the data slightly unwieldy, and quick inspections show that there are several other problems with the data:
+
++ There are a lot of missing values
++ `X` and `user_name` do not provide any information about the class variable
++ `new_window` is formatted as a factor while it is a boolean
++ Some columns are automatically read as factors, while they contain numerical data
++ Some columns have only nonsensical data.
+
+# Clean-up
+Based on the problems diagnosed in the previous paragraph, the following functions together aim to clean up the data:
+
+```{r cleanup}
+getUseLessSkew <- function(skews) {
+  colnames(skews)[sapply(skews, function(skew) {
+    (identical(levels(skew),c("", "#DIV/0!")))
+  })]
+}
+
+getMostlyEmpty <- function(df) {
+  nrowdf <- nrow(df)
+  colnames(df)[sapply(df, function(col) {
+    (sum(is.na(col)) > (0.5 * nrowdf))
+  })]
+}
+
+cleanup <- function(df, useLessSkew, mostlyEmpty) {
+  df$X <- NULL # Actually, things are ordered by X in the training set, but lets assume that's not how it is in the test set
+  df$user_name <- NULL
+  df$problem_id <- NULL
+  df$new_window <- df$new_window == 'yes'
+  
+  cnames <- colnames(df)
+
+  # some numerical columns that are formatted as factors
+  misFactored <- grep("^(kurtosis|max|min)", cnames)
+  for (mis in misFactored) {
+    df[[mis]] <- as.numeric(df[[mis]])
+  }
+  
+  # the amplitude columns are pretty informationless
+  amps <- cnames[grep("^amplitude", cnames)]
+  for (amp in amps) {
+    df[[amp]] <- NULL
+  }
+  
+  # some skew columns are informationless, others have real data
+  skew <- cnames[grep("^skewness", cnames)]
+  useFullSkew <- setdiff(skew, useLessSkew)
+  
+  for (full in useFullSkew) {
+    df[[full]] <- as.numeric(df[[full]])
+  }
+  
+  for (less in useLessSkew) {
+    df[[less]] <- NULL
+  }
+
+  # Removes columns with mostly missing values
+  df <- df[,setdiff(colnames(df), mostlyEmpty)]
+  
+  df
+}
+
+
+getNumericCols <- function(df) {
+  cnames <- colnames(df)
+  inRes <- c()
+  for (name in cnames) {
+    if ( is.numeric(df[[name]]) & sum(is.na(df[[name]])) == 0) {
+      inRes <- c(inRes, name)
+    }
+  }
+  inRes
+}
+
+splitForNumeric <- function(df) {
+  numericCols <- getNumericCols(df)
+  numericData <- df[,numericCols]
+  nonNumericData <- df[,setdiff(colnames(df),numericCols)]
+  
+  list(numeric = numericData, nonNumeric= nonNumericData)
+}
+```
+
+A quick check shows that applying this function actually removes all missing values for both datasets:
+
+```{r missingCheck}
+useLessSkew <- union(getUseLessSkew(training[, grep("^skewness", colnames(training))]),
+                       getUseLessSkew(testing[,grep("^skewness", colnames(testing))]))
+mostlyEmpty <- union(getMostlyEmpty(training),getMostlyEmpty(testing))
+cleanTraining <- cleanup(training, useLessSkew, mostlyEmpty)
+cleanTesting <- cleanup(testing, useLessSkew, mostlyEmpty)
+
+sum(complete.cases(cleanTraining)) == nrow(cleanTraining)
+sum(complete.cases(cleanTesting)) == nrow(cleanTesting)
+
+rm(useLessSkew, mostlyEmpty, cleanTraining, cleanTesting)
+```
+
+To further improve the data, PCA can be applied. However, PCA can only be applied to numeric columns. The following piece of code selects those columns, trains a PCA model on the trainingdata and applies it to both the training and testing data. It also applies the `cleanup` function, making both datasets ready for training and predicting.
+
+```{r useData}
+# Returns the names of columns containing numeric values
+# and no missing values
+getNumericCols <- function(df) {
+  cnames <- colnames(df)
+  inRes <- c()
+  for (name in cnames) {
+    if ( is.numeric(df[[name]]) & sum(is.na(df[[name]])) == 0) {
+      inRes <- c(inRes, name)
+    }
+  }
+  inRes
+}
+
+# Splits the data into numeric and non-numeric columns
+splitForNumeric <- function(df) {
+  numericCols <- getNumericCols(df)
+  numericData <- df[,numericCols]
+  nonNumericData <- df[,setdiff(colnames(df),numericCols)]
+  
+  list(numeric = numericData, nonNumeric= nonNumericData)
+}
+
+# Applies the cleanup function and PCA to get
+# data that is ready to train and predict with
+getUseData <- function(training, testing) {
+  useLessSkew <- union(getUseLessSkew(training[, grep("^skewness", colnames(training))]),
+                       getUseLessSkew(testing[,grep("^skewness", colnames(testing))]))
+  mostlyEmpty <- union(getMostlyEmpty(training),getMostlyEmpty(testing))
+  cleanTraining <- cleanup(training, useLessSkew, mostlyEmpty)
+  cleanTesting <- cleanup(testing, useLessSkew, mostlyEmpty)
+  
+  splitTraining <- splitForNumeric(cleanTraining)
+  splitTesting <- splitForNumeric(cleanTesting)
+  
+  preMod <- preProcess(splitTraining$numeric, method = 'pca')
+  richAndCleanTraining <- cbind(predict(preMod, splitTraining$numeric), 
+                                splitTraining$nonNumeric)
+  richAndCleanTesting <- cbind(predict(preMod, splitTesting$numeric),
+                               splitTesting$nonNumeric)
+  
+  list(training = richAndCleanTraining, testing = richAndCleanTesting)
+}
+
+# Execute  functions to obtain the desired data
+set.seed(1115)
+useData <- getUseData(training, testing)
+useTraining <- useData$training
+useTesting <- useData$testing
+
+rm(useData)
+```
+
+The new datasets now have `r ncol(useTraining)` instead of `r ncol(training)` columns, and no missing or nonsensical values.
+
+# Predicting
+In order to predict `classe` from the remaining variables, an ensemble of different algorithms is used. To create this ensemble, first the four base algorithms are run on the cleaned up training data: random forest, boosted trees, generalized boosted model and averaged neural networks. The predictions from these models on the training data are used in turn to train another random forest model. To predict on the test data, predictions are first made with the base models and these are combined to serve as inputdata to predict with from the aggregrate random forest model.
+
+```{r predicting}
+getBaseModels <- function(training) {
+  modelRF <- train(classe ~., method = 'rf', data = training, 
+                  trControl = trainControl(method = 'cv', number = 3), ntree = 100)
+  modelTreeBag <- train(classe ~., method = 'treebag', data = training, 
+                   trControl = trainControl(method = 'cv', number = 3))
+  modelGBM <- train(classe ~., method = 'gbm', data = training, 
+                  trControl = trainControl(method = 'cv', number = 3), verbose = FALSE)
+  
+  list(modelRF = modelRF, modelTreeBag = modelTreeBag,
+       modelGBM = modelGBM)
+}
+
+getBasePredictions <- function(baseModels, baseData) {
+  basePredictions <- lapply(baseModels, predict, baseData)
+  names(basePredictions) <- sub('model', 'pred', names(basePredictions))
+  
+  as.data.frame(basePredictions)
+}
+
+getEnsembleModel <- function(models, training) {
+  ensembleData <- cbind(getBasePredictions(models, training), classe = training$classe)
+  
+  ensembleRF <- train(classe ~., method = 'rf', data = ensembleData,
+                      trControl = trainControl(method = 'cv', number = 3), ntree = 50)
+  list(ensemble = ensembleRF, baseModels = models)
+}
+
+getEnsemblePredictions <- function(model, testing) {
+  ensembleData <- cbind(getBasePredictions(model$baseModels, testing))
+  ensemblePrediction <- predict(model$ensemble, ensembleData)
+}
+
+set.seed(41)
+ensembleModel <- getEnsembleModel(getBaseModels(useTraining), useTraining)
+ensemblePredictions <- getEnsemblePredictions(ensembleModel, useTesting)
+
+# Predictions on the test-set
+ensemblePredictions
+```
+
+```{r writeAway, include = FALSE}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(ensemblePredictions)
+```
+
+# Error
+The error is estimated by using crossvalidation on the algorithms. The estimated accuracy on the ensemble model is `r mean(ensembleModel$ensemble$resample$Accuracy)`, making the estimated error 1 - `r mean(ensembleModel$ensemble$resample$Accuracy)` = `r 1 - mean(ensembleModel$ensemble$resample$Accuracy)`. Since crossvalidation was used to make this estimate, that is: the estimate is out-of-sample, this is a fairly good indicator of the overall accuracy of the model.
